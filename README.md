@@ -5,11 +5,13 @@ Instructions for use:
 This script is to be run in Google Earth Engine Code Editor. 
 This requires a free user account which can be created here: https://earthengine.google.com/new_signup/ 
 
-Fill in the required user inputs (draw area of interest, define dates and export folder in your Google Drive), then click Run.
+Copy-paste the script from 'GEE Script' into the Google Earth Engine Code Editor window.
+
+Fill in the required user inputs (1. draw area of interest, 2. define dates and 3. set export folder in your Google Drive), then click Run.
 
 The result can be downloaded as a Geotiff by clicking on the Tasks tab, in the panel to the right. 
 The images include 5 bands: 'B2' = blue, 'B3' = green, 'B4' = red, 'B8' = near-infrared, 'NDVI' = Normalised Difference Vegetation Index
-These can be viewed as RGB composites, false colour composites, or as a single band NDVI. 
+These can later be viewed as RGB composites, false colour composites, or as a single band NDVI. 
 
 How it works:
 
