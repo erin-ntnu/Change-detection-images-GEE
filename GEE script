@@ -1,0 +1,234 @@
+// Author: Erin Lindsay. erin.lindsay@ntnu.no
+// Created: 18.02.2022
+
+//Instructions for use:
+
+// This script is to be run in Google Earth Engine Code Editor. 
+// This requires a free user account which can be created here: https://earthengine.google.com/new_signup/ 
+
+// Fill in the required user inputs, then click Run.
+
+// The result can be downloaded as a Geotiff by clicking on the Tasks tab, in the panel to the right. 
+// The images include 5 bands: 'B2' = blue, 'B3' = green, 'B4' = red, 'B8' = near-infrared, 'NDVI' = Normalised Difference Vegetation Index
+// These can be viewed as RGB composites, false colour composites, or as a single band NDVI. 
+
+// How it works:
+
+// Cloud filtering is done using the COPERNICUS/S2_CLOUD_PROBABILITY dataset, 
+// the ee.Algorithms.Sentinel2.CDI() method for computing a cloud displacement index 
+// and directionalDistanceTransform() for computing cloud shadows.
+// Source: https://developers.google.com/earth-engine/tutorials/community/sentinel-2-s2cloudless 
+
+// Snow filtering is done using the SCL band from the Level-2A product COPERNICUS/S2
+
+// Pre- and post-event composite images are made from the filtered Sentinel-2 Level 2A images, using the greenest-pixel method. 
+// The difference image is created by subtracting the pre-event image from the post-event image. 
+
+// ##########################   User Inputs: #########################################
+// ###################################################################################
+
+// 1. Define area of interest: 
+// In the bottom map window, using the drawing buttons to the left, draw a polygon or rectangle around your area of interest. 
+// This will create a variable called 'geometry' that will appear above the code editor window under the 'Imports'.
+
+// 2. Define date ranges for producing the pre- and post-event greenest-pixel, cloud free composite images. 
+// This could be done either for 1 month before and after the landslide event - if the events occurred in summer, 
+// OR if the events occured in another season, use images from the months of peak green vegetation (and minimal shadows) 
+// from the summer before and after the landslides occured (1 year apart).  e.g. PRE = June 2019, and POST = June 2020. 
+
+        // PRE-EVENT IMAGE
+        // Dates over which to create a composite.
+        var pre_start = ee.Date('2019-07-01');
+        var pre_end = ee.Date('2019-07-31');
+        
+        // POST-EVENT IMAGE
+        // Dates over which to create a median composite.
+        var post_start = ee.Date('2019-08-01');
+        var post_end = ee.Date('2019-09-01');
+        
+// 3. Set the name of the google drive-folder where you want the image to be exported to.
+        
+        var my_google_drive_folder = "earthengine";
+
+// #####################################################################################
+// #####################################################################################
+
+// Visualisation parameters:
+
+// dNDVI
+var dNDVI_params = {bands:"NDVI", min:-0.6, max:0.1};
+
+// RGB true colour
+var viz_rgb = {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000};
+
+// #########################   Functions #########################
+// Add NDVI  
+  function addS2NDVI(image) {
+    var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+    return image.addBands(ndvi);
+  }
+
+// snow mask 
+function maskSnow(image) {
+//  var lake_mask = ee.Image.constant(1).clip(lakes).mask().not();
+  var SCL = image.select('SCL');
+  var snow = SCL.eq(11).toFloat();
+  snow = snow.not().focal_min({radius: 300, units: 'meters'});
+  return image
+  .updateMask(snow)
+//  .updateMask(lake_mask)
+  .clip(geometry);
+}
+
+// Cloud and shadow filtering:
+
+// Join two collections on their 'system:index' property.
+// The propertyName parameter is the name of the property
+// that references the joined image.
+function indexJoin(collectionA, collectionB, propertyName) {
+  var joined = ee.ImageCollection(ee.Join.saveFirst(propertyName).apply({
+    primary: collectionA,
+    secondary: collectionB,
+    condition: ee.Filter.equals({
+      leftField: 'system:index',
+      rightField: 'system:index'})
+  }));
+  // Merge the bands of the joined image.
+  return joined.map(function(image) {
+    return image.addBands(ee.Image(image.get(propertyName)));
+  });
+}
+
+// Aggressively mask clouds and shadows.
+function maskImage(image) {
+  // Compute the cloud displacement index from the L1C bands.
+  var cdi = ee.Algorithms.Sentinel2.CDI(image);
+  var s2c = image.select('probability');
+  var cirrus = image.select('B10').multiply(0.0001);
+
+  // Assume low-to-mid atmospheric clouds to be pixels where probability
+  // is greater than 65%, and CDI is less than -0.5. For higher atmosphere
+  // cirrus clouds, assume the cirrus band is greater than 0.01.
+  // The final cloud mask is one or both of these conditions.
+  var isCloud = s2c.gt(65).and(cdi.lt(-0.5)).or(cirrus.gt(0.01));
+
+  // Reproject is required to perform spatial operations at 20m scale.
+  // 20m scale is for speed, and assumes clouds don't require 10m precision.
+  isCloud = isCloud.focal_min(3).focal_max(16);
+  isCloud = isCloud.reproject({crs: cdi.projection(), scale: 20});
+
+  // Project shadows from clouds we found in the last step. This assumes we're working in
+  // a UTM projection.
+  var shadowAzimuth = ee.Number(90)
+      .subtract(ee.Number(image.get('MEAN_SOLAR_AZIMUTH_ANGLE')));
+      
+  // With the following reproject, the shadows are projected 5km.
+  isCloud = isCloud.directionalDistanceTransform(shadowAzimuth, 50);
+  isCloud = isCloud.reproject({crs: cdi.projection(), scale: 100});
+
+  isCloud = isCloud.select('distance').mask();
+  return image.select('B2', 'B3', 'B4', 'B8', 'SCL', 'NDVI').float()
+  .updateMask(isCloud.not())
+;
+}
+
+// #########################   Import Image Collections  #########################
+
+// Sentinel-2 Level 1C data.  Bands B7, B8, B8A and B10 from this
+// dataset are needed as input to CDI and the cloud mask function.
+var s2 = ee.ImageCollection('COPERNICUS/S2');
+// Cloud probability dataset.  The probability band is used in
+// the cloud mask function.
+var s2c = ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY');
+// Sentinel-2 surface reflectance data for the composite.
+var s2Sr = ee.ImageCollection('COPERNICUS/S2_SR');
+
+var region = geometry
+Map.centerObject(geometry);
+
+// #########################   Make Pre Image  #########################
+
+// S2 L1C for Cloud Displacement Index (CDI) bands.
+var pre_s2 = s2.filterBounds(geometry).filterDate(pre_start, pre_end)
+    .select(['B7', 'B8', 'B8A', 'B10']);
+// S2Cloudless for the cloud probability band.
+var pre_s2c = s2c.filterDate(pre_start, pre_end).filterBounds(geometry);
+// S2 L2A for surface reflectance bands.
+var pre_s2Sr = s2Sr.filterDate(pre_start, pre_end).filterBounds(geometry)
+    .map(addS2NDVI)
+    .select(['B2', 'B3', 'B4', 'B5', 'B8', 'SCL', 'NDVI']);
+
+// Join the cloud probability dataset to surface reflectance.
+var pre_withCloudProbability = indexJoin(pre_s2Sr, pre_s2c, 'cloud_probability');
+// Join the L1C data to get the bands needed for CDI.
+var pre_withS2L1C = indexJoin(pre_withCloudProbability, pre_s2, 'l1c');
+// print(pre_withS2L1C);
+
+// Map the cloud masking function over the joined collection.
+var pre_masked = ee.ImageCollection(pre_withS2L1C.map(maskImage).map(maskSnow));
+  print('list of images used in pre composite', pre_masked);
+
+var pre_qualM = pre_masked.qualityMosaic('NDVI').select(['B2', 'B3', 'B4', 'B8', 'NDVI']);
+print(pre_qualM);
+
+// Display the results.
+Map.addLayer(pre_qualM, viz_rgb, 'pre greenest RGB composite');
+
+// #########################   Make Post Image  #########################
+
+// S2 L1C for Cloud Displacement Index (CDI) bands.
+var post_s2 = s2.filterBounds(geometry).filterDate(post_start, post_end)
+    .select(['B7', 'B8', 'B8A', 'B10']);
+// S2Cloudless for the cloud probability band.
+var post_s2c = s2c.filterDate(post_start, post_end).filterBounds(geometry);
+// S2 L2A for surface reflectance bands.
+var post_s2Sr = s2Sr.filterDate(post_start, post_end).filterBounds(geometry)
+    .map(addS2NDVI)
+    .select(['B2', 'B3', 'B4', 'B5', 'B8', 'SCL', 'NDVI']);
+
+// Join the cloud probability dataset to surface reflectance.
+var post_withCloudProbability = indexJoin(post_s2Sr, post_s2c, 'cloud_probability');
+// Join the L1C data to get the bands needed for CDI.
+var post_withS2L1C = indexJoin(post_withCloudProbability, post_s2, 'l1c');
+// print(post_withS2L1C);
+
+// Map the cloud masking function over the joined collection.
+var post_masked = ee.ImageCollection(post_withS2L1C.map(maskImage).map(maskSnow))
+  print('list of images used in post composite', post_masked);
+
+var post_qualM = post_masked.qualityMosaic('NDVI').select(['B2', 'B3', 'B4', 'B8', 'NDVI']);
+print(post_qualM);
+
+// Display the results.
+Map.addLayer(post_qualM, viz_rgb, 'post greenest RGB composite');
+
+// #########################   Make Difference Image  #########################
+
+var diff = post_qualM.subtract(pre_qualM);
+Map.addLayer(diff, dNDVI_params, 'dNDVI_cloud_filtered');
+
+// ##################    EXPORT IMAGES   ##########################
+  
+Export.image.toDrive({
+		image : pre_qualM,
+		description : 'cloud_snow_masked_qualM_S2_SR_pre',
+		scale : 10,
+		folder : my_google_drive_folder,
+		region : geometry
+	});
+
+Export.image.toDrive({
+		image : post_qualM,
+		description : 'cloud_snow_masked_qualM_S2_SR_post',
+		scale : 10,
+		folder : my_google_drive_folder,
+		region : geometry
+	});	
+
+Export.image.toDrive({
+		image : diff,
+		description : 'cloud_snow_masked_qualM_S2_SR_diff',
+		scale : 10,
+		folder : my_google_drive_folder,
+		region : geometry
+	});
