@@ -49,6 +49,12 @@
 // 3. Set the name of the google drive-folder where you want the image to be exported to.
         
         var my_google_drive_folder = "earthengine";
+	
+// 4. Click Run -  A grey box on the Map label (top right in Map Window) means the image is loading. This can take a few minutes. 
+// Inspect the results. You can also toggle on or off map layers if you click on the Map button. 
+// Check results are reasonable - look at the pre and post RGB images to see if there are clouds remaining, or snow, that will affect the NDVI results.
+
+// 5. In the Tasks panel (top right), you can export the images to your google drive folder. 
 
 // #####################################################################################
 // #####################################################################################
