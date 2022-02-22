@@ -1,0 +1,314 @@
+/**
+ *  * Make difference images for change detection. 
+ *  Pre-process and visualize Sentinel-1 radar data and Sentinel-2 optical data.
+ * The S1 processing steps have been modified from a tutorial by Eric Bullock, eric.bullock@usda.gov, see: https://www.youtube.com/watch?v=JZbLokRI8as&t=1210s
+ */
+ /**
+*/
+// ##########################   User Inputs: #########################################
+// ###################################################################################
+
+// 1. Define area of interest: 
+// In the bottom map window, using the drawing buttons to the left, draw a point approxmately in the center of your area of interest. 
+// This will create a variable called 'geometry' that will appear above the code editor window under the 'Imports'.
+
+// 2. Define date ranges for producing the composite images. 
+// This may be done for 1 month before and after the event to get good results for both optical and SAR images.  
+// OR if the optical images are affected by clouds, snow, darkness etc. Run this again with different date ranges-  
+// e.g. from the summer before and after the event (1 year apart).  e.g. PRE = June 2019, and POST = June 2020. 
+
+        // PRE-EVENT IMAGE
+        // Dates over which to create a composite.
+        var pre_start = ee.Date('2019-07-01');
+        var pre_end = ee.Date('2019-07-29');
+        
+        // POST-EVENT IMAGE
+        // Dates over which to create a median composite.
+        var post_start = ee.Date('2019-08-01');
+        var post_end = ee.Date('2019-09-01');
+        
+// 3. Set the name of the google drive-folder where you want the image to be exported to.
+        
+        var my_google_drive_folder = "earthengine";
+        
+// 4. Set DEM 
+        //Norway: DTM 10 m 
+        var DEM = ee.Image('users/jarnaalexandra/TerrengNorge3').select('elev')
+        
+        // //Global: NASA SRTM Digital Elevation 30m
+        // var DEM = ee.Image('USGS/SRTMGL1_003')
+
+// ####################### Calculate Geometry #################################
+var point = (geometry);
+var region = point.buffer(10000).bounds(); // Here you can adjust the size of your area of interest, by altering the size of the buffer zone. 
+
+
+  // ####################### Make Image Collections #################################
+  //  Get pre- and post-event collections of Sentinel-1 radar data.
+
+var pre_data = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterMetadata('transmitterReceiverPolarisation','equals',["VV", "VH"])
+  .filterMetadata('instrumentMode','equals','IW')
+  .filterDate(pre_start, pre_end)
+
+var pre_s = pre_data.aggregate_histogram('transmitterReceiverPolarisation')
+print('size of pre collection', pre_data.size())
+
+var post_data = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(region)
+  .filterMetadata('transmitterReceiverPolarisation','equals',["VV", "VH"])
+  .filterMetadata('instrumentMode','equals','IW')
+  .filterDate(post_start, post_end)
+
+var post_s = post_data.aggregate_histogram('transmitterReceiverPolarisation')
+print('size of post collection', post_data.size())
+/**
+*  Count Frequency of Ascending and Descending Orbital Passes
+*/
+var identify_pre  = ee.Dictionary(pre_data.aggregate_histogram('orbitProperties_pass'))
+print('Number of images in each orbital direction (pre)', identify_pre )
+
+var identify_post  = ee.Dictionary(post_data.aggregate_histogram('orbitProperties_pass'))
+print('Number of images in each orbital direction (post)', identify_post )
+
+
+  // ####################### Topographic correction function #################################
+/**
+* Radiometric slope correction algorithm for topographic correction
+* Author: Andreas Vollrath, described in https://doi.org/10.3390/rs12111867
+*/
+var slope_correction = function (collection,
+                                options
+                                ){
+
+    // set defaults if undefined options
+    options = options || {};
+    var model = options.model || 'volume';
+    var elevation = options.elevation || DEM
+    // var elevation = options.elevation || ee.Image(DEM);  
+    var buffer = options.buffer || 0;
+
+    // we need a 90 degree in radians image for a couple of calculations
+    var ninetyRad = ee.Image.constant(90).multiply(Math.PI/180);
+
+    // Volumetric Model Hoekman 1990
+    function _volume_model(theta_iRad, alpha_rRad){
+
+      var nominator = (ninetyRad.subtract(theta_iRad).add(alpha_rRad)).tan();
+      var denominator = (ninetyRad.subtract(theta_iRad)).tan();
+      return nominator.divide(denominator);
+    }
+
+    // surface model Ulander et al. 1996
+    function _surface_model(theta_iRad, alpha_rRad, alpha_azRad){
+
+      var nominator = (ninetyRad.subtract(theta_iRad)).cos();
+      var denominator = alpha_azRad.cos()
+        .multiply((ninetyRad.subtract(theta_iRad).add(alpha_rRad)).cos());
+      return nominator.divide(denominator);
+    }
+
+    // buffer function (thanks Noel)
+    function _erode(img, distance) {
+
+      var d = (img.not().unmask(1)
+          .fastDistanceTransform(30).sqrt()
+          .multiply(ee.Image.pixelArea().sqrt()));
+
+      return img.updateMask(d.gt(distance));
+    }
+
+    // calculate masks
+    function _masking(alpha_rRad, theta_iRad, proj, buffer){
+
+        // layover, where slope > radar viewing angle
+        var layover = alpha_rRad.lt(theta_iRad).rename('layover');
+
+        // shadow
+        var shadow = alpha_rRad.gt(ee.Image.constant(-1).multiply(ninetyRad.subtract(theta_iRad))).rename('shadow');
+
+        // combine layover and shadow
+        var mask = layover.and(shadow);
+
+        // add buffer to final mask
+        if (buffer > 0)
+            mask = _erode(mask, buffer);
+
+        return mask.rename('no_data_mask');
+  }
+
+    function _correct(image){
+
+        // get image geometry and projection
+        var geom = image.geometry();
+        var proj = image.select(1).projection();
+
+        // get look direction angle
+        var heading = (ee.Terrain.aspect(
+            image.select('angle')).reduceRegion(ee.Reducer.mean(), geom, 1000).get('aspect')
+            );
+
+        // Sigma0 to Power of input image
+        var sigma0Pow = ee.Image.constant(10).pow(image.divide(10.0));
+
+        // Radar geometry
+        var theta_iRad = image.select('angle').multiply(Math.PI/180).clip(geom);
+        var phi_iRad = ee.Image.constant(heading).multiply(Math.PI/180);
+
+        // Terrain geometry
+        var alpha_sRad = ee.Terrain.slope(elevation).select('slope')
+            .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+        var phi_sRad = ee.Terrain.aspect(elevation).select('aspect')
+            .multiply(Math.PI/180).setDefaultProjection(proj).clip(geom);
+
+        // Model geometry
+
+        //reduce to 3 angle
+        var phi_rRad = phi_iRad.subtract(phi_sRad);
+
+        // slope steepness in range
+        var alpha_rRad = (alpha_sRad.tan().multiply(phi_rRad.cos())).atan();
+
+        // slope steepness in azimuth
+        var alpha_azRad = (alpha_sRad.tan().multiply(phi_rRad.sin())).atan();
+
+        // Gamma_nought
+        var gamma0 = sigma0Pow .divide(theta_iRad.cos());
+
+              // models
+        if (model == 'volume')
+          var corrModel = _volume_model(theta_iRad, alpha_rRad);
+
+        if (model == 'surface')
+          var corrModel = _surface_model(theta_iRad, alpha_rRad, alpha_azRad);
+
+        if (model == 'direct')
+          var corrModel = _direct_model(theta_iRad, alpha_rRad, alpha_azRad);
+
+        // apply model to derive gamma0_flat
+        var gamma0_flat = gamma0.divide(corrModel);
+
+        // transform to dB-scale
+        var gamma0_flatDB = (ee.Image.constant(10)
+            .multiply(gamma0_flat.log10()).select(['VV', 'VH'])
+            );
+
+        // get Layover/Shadow mask
+        var mask = _masking(alpha_rRad, theta_iRad, proj, buffer);
+
+        // return gamma_flat plus mask
+        return gamma0_flatDB.addBands(mask).copyProperties(image);
+
+
+    }
+
+    // run correction function and return corrected collection
+    return collection.map(_correct);
+
+};
+
+// export function
+exports.slope_correction = slope_correction;
+
+// ####################### Create terrain corrected Pre- and Post- Event images #################################
+
+var pre_corrected = slope_correction(pre_data)                          // Apply terrain correction
+  .map(function(im) {return im.updateMask(im.select('no_data_mask'))})  // Apply no data mask
+  .reduce(ee.Reducer.mean())                                            // Take the mean of the image collection, to make a single image
+  .rename(pre_data.first().bandNames())
+  .clip(region)
+  
+var post_corrected = slope_correction(post_data)
+  .map(function(im) {return im.updateMask(im.select('no_data_mask'))}) // Apply no data mask
+  .reduce(ee.Reducer.mean())
+  .rename(post_data.first().bandNames())
+  .clip(region)
+  
+var pre_VV = pre_corrected.select('VV').rename('preVV');
+var pre_VH = pre_corrected.select('VH').rename('preVH');
+
+var post_VV = post_corrected.select('VV').rename('postVV');
+var post_VH = post_corrected.select('VH').rename('postVH');
+
+var diff_VV = (post_VV.subtract(pre_VV)).rename('diffVV');
+var diff_VH = (post_VH.subtract(pre_VH)).rename('diffVH');
+
+var SAR_RGB_VV = post_VV.addBands(pre_VV).addBands(diff_VV);
+var SAR_RGB_VH = post_VH.addBands(pre_VH).addBands(diff_VH);
+
+// Visualisation parameters:
+
+// dNDVI
+var dNDVI_params = {bands:"NDVI", min:-0.6, max:0.1};
+
+// RGB true colour
+var viz_rgb = {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000, gamma: 1.5};
+
+// #########################  S2 Functions #########################
+// Add NDVI  
+  function addS2NDVI(image) {
+    var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+    return image.addBands(ndvi);
+  }
+// ###############   Import Sentinel-2 Image Collection  ##################
+
+// Sentinel-2 surface reflectance data for the composite.
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR');
+
+// #########################   Make S2 Pre Image  #########################
+
+var pre_filtered = S2.filterDate(pre_start, pre_end)
+    .filterBounds(region)
+    .map(addS2NDVI);
+var pre_image = ee.Image(pre_filtered.qualityMosaic('NDVI')).select(['B2', 'B3', 'B4', 'B8', 'NDVI']).clip(region);
+
+// #########################   Make S2 Post Image  #########################
+
+var post_filtered = S2.filterDate(post_start, post_end)
+    .filterBounds(region)
+    .map(addS2NDVI);
+var post_image = ee.Image(post_filtered.qualityMosaic('NDVI')).select(['B2', 'B3', 'B4', 'B8', 'NDVI']).clip(region);
+// post_image = maskLakes(post_image);
+
+// #########################   Make S2 Difference Image  #########################
+
+var diff = post_image.subtract(pre_image);
+var ndvi_inv = diff.select('NDVI').multiply(-1).rename('-NDVI');
+ndvi_inv = ndvi_inv.addBands(ndvi_inv)
+
+// #########################   Make S1-S2 composite Image  #####################
+
+ var S1_S2_comp = ndvi_inv.addBands(diff_VV).addBands(diff_VH);
+ 
+// #########################   Slope and hillshade  #####################
+var DEM_clip = DEM.clip(region);
+//Map.addLayer(DEM_clip, {min: 0, max: 1600, palette: ['000FFF', '57874d', 'e2dba7', 'fcc573', 'b69c8d', 'ffffff']}, 'dtm10', false);
+
+// create hillshade
+var hillshade = ee.Terrain.hillshade(DEM_clip, 135, 45);
+
+// create slope
+var slope = ee.Terrain.slope(DEM_clip);
+
+// #########################   Display the results  #########################
+Map.addLayer(hillshade, {}, 'hillshade', false);
+Map.addLayer(slope, {'min':0, 'max':90, palette: ['blue', 'green','yellow','orange','red']}, 'slope', false);
+Map.addLayer(pre_image, viz_rgb, 'pre-event RGB composite', false);
+Map.addLayer(post_image, viz_rgb, 'post-event RGB composite', false);
+Map.addLayer(diff, dNDVI_params, 'dNDVI', false);
+Map.addLayer(ndvi_inv, {bands:'-NDVI', min: -0.1, max:0.6}, 'dNDVI_inv', false);
+Map.addLayer(diff_VV, {bands: 'diffVV', min: -2, max: 7}, 'diffVV', false);
+Map.addLayer(diff_VH, {bands: 'diffVH', min: -2, max: 5.6}, 'diffVH', false);
+Map.addLayer(SAR_RGB_VV, {bands:['preVV', 'postVV', 'preVV'], min:[-21], max:[0.5], gamma: 0.65}, 'SAR_RGB_VV');
+Map.addLayer(SAR_RGB_VH, {bands:['preVH', 'postVH', 'preVH'], min:[-28], max:[4], gamma: 0.65}, 'SAR_RGB_VH', false)
+
+// #########################   Export the results  #########################
+
+	Export.image.toDrive({
+		image : SAR_RGB_VV,
+		description : 'SAR_RGB_VV',
+		scale : 10,
+		folder : my_google_drive_folder,
+		region : region,
+	});
