@@ -4,8 +4,12 @@ The scripts in this repository are to be run in Google Earth Engine Code Editor.
 This requires a gmail account, and free Google Earth Engine user account which can be created here: https://earthengine.google.com/new_signup/ 
 
 Options: 
-1. GEE Script: dNDVI (fast)
-2. GEE Script: dNDVI (slow, cloud filtering)
+1. GEE Script: S2 - dNDVI (fast)
+2. GEE Script: S2 - dNDVI (slow, cloud filtering)
+3. GEE Script: S1 and S2 change detection 
+
+The S2 gives good results for events in summer. 
+The S1 gives relatively good results for events in all seasons. 
 
 Both versions of give good results for dNDVI, if used over months with green vegetation. However the fast version does not filter for clouds directly, so there are some strange results over water, and if zoomed in on the RGB image. The slow version gives better RGB image outputs. But takes a lot longer to run. 
 
